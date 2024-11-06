@@ -3,7 +3,7 @@ CULane dataset settings.
 """
 
 dataset_type = "CULane"
-dataset_path = "data/CULane"
+dataset_path = "/kaggle/input/culane-f1/CULane"
 
 ori_img_w = 1640
 ori_img_h = 590
