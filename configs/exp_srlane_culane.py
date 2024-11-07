@@ -15,7 +15,7 @@ seg_loss_weight = 0.  # 0.5
 total_iter = 44440
 batch_size = 40
 eval_ep = 3
-workers = 1
+workers = 0
 log_interval = 500
 
 precision = "16-mixed"  # "32"
