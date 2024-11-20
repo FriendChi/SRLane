@@ -26,6 +26,10 @@ conda install -c conda-forge geos shapely
 conda install -c conda-forge pathspec
 conda install -c conda-forge tensorboard
 
+imgaug/augmenters/color.py中2487行后加入
+        if cls._LUT_CACHE is None:
+            cls._LUT_CACHE = cls._generate_lut_table()
+
 ```
 ### DATASET
 Download [CULane](https://xingangpan.github.io/projects/CULane.html). Then modify `dataset_path` in [configs/datasets/culane.py](configs/datasets/culane.py) accordingly.
