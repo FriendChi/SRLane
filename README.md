@@ -14,7 +14,12 @@ cd SRLane
 conda create -n py38 python=3.8 -y # Create a new Python environment, optional.
 conda activate py38 
 pip install -r requirements.txt
-pip install torch==1.13.0+cu117 # Install pytorch, modifying the CUDA version accordingly.
+
+# Install pytorch, modifying the CUDA version accordingly.
+pip uninstall urllib3
+pip uninstall urllib3
+pip install "urllib3>=1.25.4,<1.27"
+
 python setup.py develop
 ```
 ### DATASET
