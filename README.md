@@ -21,6 +21,11 @@ pip uninstall urllib3
 pip install "urllib3>=1.25.4,<1.27"
 
 python setup.py develop
+
+conda install -c conda-forge geos shapely
+conda install -c conda-forge pathspec
+conda install -c conda-forge tensorboard
+
 ```
 ### DATASET
 Download [CULane](https://xingangpan.github.io/projects/CULane.html). Then modify `dataset_path` in [configs/datasets/culane.py](configs/datasets/culane.py) accordingly.
