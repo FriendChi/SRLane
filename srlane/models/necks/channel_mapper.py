@@ -16,9 +16,9 @@ class ChannelMapper(nn.Module):
         num_outs: Number of output feature maps.
     """
     def __init__(self,
-                 in_channels: List[int],
-                 out_channels: int,
-                 num_outs: int = None,
+                 in_channels: List[int],#每个尺度的特征图的通道数列表
+                 out_channels: int,#输出特征图的目标通道数
+                 num_outs: int = None, #输出特征图的数量
                  **kwargs,
                  ):
         super(ChannelMapper, self).__init__()
