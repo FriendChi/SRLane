@@ -197,29 +197,31 @@ class RefineHead(nn.Module):
 @HEADS.register_module
 class CascadeRefineHead(nn.Module):
     def __init__(self,
-                 num_points: int = 72,
-                 prior_feat_channels: int = 64,
-                 fc_hidden_dim: int = 64,
-                 refine_layers: int = 1,
-                 sample_points: int= 36 ,
-                 num_groups: int = 6,
-                 cfg=None):
+                 num_points: int = 72,  # 每条车道线的点数量
+                 prior_feat_channels: int = 64,  # 前一层特征的通道数
+                 fc_hidden_dim: int = 64,  # 全连接层隐藏单元数
+                 refine_layers: int = 1,  # 精炼的层数
+                 sample_points: int = 36,  # 每次采样点的数量
+                 num_groups: int = 6,  # 分组的数量
+                 cfg=None):  # 配置对象
         super(CascadeRefineHead, self).__init__()
         self.cfg = cfg
-        self.img_w = self.cfg.img_w
-        self.img_h = self.cfg.img_h
-        self.n_strips = num_points - 1
-        self.n_offsets = num_points
-        self.sample_points = sample_points
-        self.refine_layers = refine_layers
-        self.fc_hidden_dim = fc_hidden_dim
-        self.num_groups = num_groups
-        self.prior_feat_channels = prior_feat_channels
+        self.img_w = self.cfg.img_w  # 图像宽度
+        self.img_h = self.cfg.img_h  # 图像高度
+        self.n_strips = num_points - 1  # 点之间的间隔数
+        self.n_offsets = num_points  # 偏移点的数量
+        self.sample_points = sample_points  # 每次采样点的数量
+        self.refine_layers = refine_layers  # 精炼层数
+        self.fc_hidden_dim = fc_hidden_dim  # 全连接层的隐藏维度
+        self.num_groups = num_groups  # 分组数
+        self.prior_feat_channels = prior_feat_channels  # 前一层通道数
 
+        # 注册缓冲区，生成均匀分布的 y 坐标点
         self.register_buffer(name="prior_ys",
                              tensor=torch.linspace(1, 0, steps=self.n_offsets,
                                                    dtype=torch.float32))
 
+        # 创建多个精炼层，每层使用 `RefineHead`
         self.stage_heads = nn.ModuleList()
         for i in range(refine_layers):
             self.stage_heads.append(
@@ -232,52 +234,63 @@ class CascadeRefineHead(nn.Module):
                            num_groups=num_groups,
                            cfg=cfg))
 
+        # 定义分类损失函数，使用 FocalLoss
         self.cls_criterion = FocalLoss(alpha=0.25, gamma=2.)
 
-    def forward(self, x, **kwargs):
-        batch_features = list(x)
-        batch_features.reverse()
-        priors = kwargs["priors"]
-        pre_feature = None
-        predictions_lists = []
-        attn_lists = []
 
-        # iterative refine
+      def forward(self, x, **kwargs):
+        batch_features = list(x)  # 获取输入的特征
+        batch_features.reverse()  # 逆序特征以便从高到低分辨率处理
+        priors = kwargs["priors"]  # 提取先验信息
+        pre_feature = None  # 存储前一层输出的特征
+        predictions_lists = []  # 用于保存每层的预测结果
+        attn_lists = []  # 用于保存注意力特征
+
+        # 逐层精炼
         for stage in range(self.refine_layers):
+            # 调用对应的 `RefineHead` 层
             predictions, pre_feature, attn = self.stage_heads[stage](
                 batch_features, priors,
                 pre_feature)
-            predictions_lists.append(predictions)
-            attn_lists.append(attn)
+            predictions_lists.append(predictions)  # 记录预测结果
+            attn_lists.append(attn)  # 记录注意力
 
+            # 除了最后一层外，将预测作为下一层的先验
             if stage != self.refine_layers - 1:
                 priors = predictions.clone().detach()
 
+        # 如果是训练阶段，返回多层预测和注意力信息
         if self.training:
             output = {"predictions_lists": predictions_lists,
                       "attn_lists": attn_lists}
             return output
+
+        # 测试阶段仅返回最后一层的预测
         return predictions_lists[-1]
+
 
     def loss(self,
              output,
              batch):
-        predictions_lists = output["predictions_lists"]
-        attn_lists = output["attn_lists"]
-        targets = batch["gt_lane"].clone()
+        predictions_lists = output["predictions_lists"]  # 获取各层预测结果
+        attn_lists = output["attn_lists"]  # 获取各层注意力
+        targets = batch["gt_lane"].clone()  # 获取目标车道线信息
 
-        cls_loss = 0
-        l1_loss = 0
-        iou_loss = 0
-        attn_loss = 0
+        cls_loss = 0  # 分类损失
+        l1_loss = 0  # 平滑 L1 损失
+        iou_loss = 0  # IoU 损失
+        attn_loss = 0  # 注意力损失
 
+        # 遍历每一层的预测结果
         for stage in range(0, self.refine_layers):
             predictions_list = predictions_lists[stage]
             attn_list = attn_lists[stage]
             for idx, (predictions, target, attn) in enumerate(
                     zip(predictions_list, targets, attn_list)):
+                # 过滤目标值
                 target = target[target[:, 1] == 1]
                 if len(target) == 0:
+                    # 如果没有有效目标，仅计算分类损失
                     cls_target = predictions.new_zeros(
                         predictions.shape[0]).long()
                     cls_pred = predictions[:, :2]
@@ -285,27 +298,30 @@ class CascadeRefineHead(nn.Module):
                         cls_pred, cls_target).sum()
                     continue
 
+                # 标准化预测值
                 predictions = torch.cat((predictions[:, :2],
                                          predictions[:, 2:4] * self.n_strips,
                                          predictions[:, 4:] * self.img_w),
                                         dim=1)
 
+                # 分配匹配目标
                 with torch.no_grad():
                     (matched_row_inds, matched_col_inds) = assign(
                         predictions, target, self.img_w,
                         k=self.cfg.angle_map_size[0])
 
+                # 计算注意力损失
                 attn_loss += MultiSegmentAttention.loss(
                     predictions[:, 4:] / self.img_w,
                     target[matched_col_inds, 4:] / self.img_w,
                     attn[:, matched_row_inds])
 
-                # classification targets
+                # 分类目标值
                 cls_target = predictions.new_zeros(predictions.shape[0]).long()
                 cls_target[matched_row_inds] = 1
                 cls_pred = predictions[:, :2]
 
-                # regression targets
+                # 回归目标值
                 reg_yl = predictions[matched_row_inds, 2:4]
                 target_yl = target[matched_col_inds, 2:4].clone()
                 with torch.no_grad():
@@ -318,21 +334,25 @@ class CascadeRefineHead(nn.Module):
                 reg_pred = predictions[matched_row_inds, 4:]
                 reg_targets = target[matched_col_inds, 4:].clone()
 
-                # Loss calculation
+                # 分类损失
                 cls_loss = cls_loss + self.cls_criterion(cls_pred, cls_target).sum(
                 ) / target.shape[0]
 
+                # 平滑 L1 损失
                 l1_loss = l1_loss + F.smooth_l1_loss(reg_yl, target_yl,
                                                        reduction="mean")
 
+                # IoU 损失
                 iou_loss = iou_loss + liou_loss(reg_pred, reg_targets,
                                                 self.img_w)
 
+        # 损失平均化
         cls_loss /= (len(targets) * self.refine_layers)
         l1_loss /= (len(targets) * self.refine_layers)
         iou_loss /= (len(targets) * self.refine_layers)
         attn_loss /= (len(targets) * self.refine_layers)
 
+        # 返回各类损失
         return_value = {"cls_loss": cls_loss,
                         "l1_loss": l1_loss,
                         "iou_loss": iou_loss,
@@ -340,90 +360,91 @@ class CascadeRefineHead(nn.Module):
 
         return return_value
 
-    def predictions_to_pred(self, predictions, img_meta):
-        """
-        Convert predictions to internal Lane structure for evaluation.
-        """
-        prior_ys = self.prior_ys.to(predictions.device)
-        prior_ys = prior_ys.double()
-        lanes = []
 
-        for lane in predictions:
-            lane_xs = lane[4:]  # normalized value
-            start = min(max(0, int(round(lane[2].item() * self.n_strips))),
-                        self.n_strips)
-            length = int(round(lane[3].item()))
-            end = start + length - 1
-            end = min(end, self.n_strips)
-            # extend its prediction until the x is outside the image
-            mask = ~((((lane_xs[:start] >= 0.) & (lane_xs[:start] <= 1.)
-                       ).cpu().numpy()[::-1].cumprod()[::-1]).astype(bool))
-            lane_xs[end + 1:] = -2
-            lane_xs[:start][mask] = -2
-            lane_ys = prior_ys[(lane_xs >= 0.) & (lane_xs <= 1.)]
-            lane_xs = lane_xs[(lane_xs >= 0.) & (lane_xs <= 1.)]
-            if len(lane_xs) <= 1:
+def predictions_to_pred(self, predictions):
+    """
+    将网络预测值转换为实际车道线的坐标点。
+
+    :param predictions: 网络的输出预测，包含分类信息和车道线点坐标
+    :return: 车道线点坐标列表
+    """
+    pred = []  # 用于存储每条车道线的预测结果
+    for prediction in predictions:
+        # 选择车道线点的有效预测概率最高的类别（背景/车道线）
+        lane_cls = prediction[:, :2].argmax(1)
+
+        # 获取当前预测中属于车道线的点索引
+        lane_inds = torch.where(lane_cls == 1)[0]
+
+        if len(lane_inds) == 0:
+            # 如果没有预测为车道线的点，继续下一条预测
+            pred.append(None)
+            continue
+
+        # 提取车道线的偏移量
+        lanes = prediction[lane_inds, 4:]
+        # 提取车道线起始 y 坐标及其范围
+        start_ys = prediction[lane_inds, 2]
+        delta_ys = prediction[lane_inds, 3]
+
+        # 根据 y 坐标偏移计算实际的 y 值
+        lane_ys = torch.arange(0, self.n_strips + 1).to(start_ys) - start_ys[:, None]
+        valid = (lane_ys >= 0) & (lane_ys < delta_ys[:, None])  # 保证 y 值在合法范围内
+        lane_ys = lane_ys * valid
+
+        # 利用偏移量计算车道线的实际 x 值
+        lane_xs = torch.einsum("ij,j->ij", lane_ys, lanes)
+
+        # 拼接 y 和 x 的坐标对
+        lane = torch.cat((lane_xs[:, :, None], lane_ys[:, :, None]), dim=2)
+
+        # 将无效值替换为 -2，表示无效点
+        lane = torch.where(valid[:, :, None], lane, torch.full_like(lane, -2))
+
+        # 转换为 numpy 格式，并添加到结果列表
+        pred.append(lane.cpu().numpy())
+
+    return pred
+
+
+def get_lanes(self, predictions):
+    """
+    从网络的预测值中提取实际的车道线表示形式（点集合）。
+
+    :param predictions: 网络输出的预测值
+    :return: 车道线的点集合，每条车道线包含其对应的点
+    """
+    out_lanes = []  # 用于存储提取后的车道线
+    out_categories = []  # 用于存储每条车道线的类别
+
+    for prediction in predictions:
+        if prediction is None:
+            # 如果当前预测为空，继续下一个
+            continue
+
+        lanes = []  # 存储当前预测中的每条车道线的点集合
+        categories = []  # 存储当前预测的每条车道线的类别
+
+        for lane in prediction:
+            # 筛选出有效点的索引（x 和 y 坐标均非 -2）
+            valid_points = (lane[:, 0] != -2) & (lane[:, 1] != -2)
+            if not valid_points.any():
+                # 如果没有有效点，则忽略该车道线
                 continue
-            lane_xs = lane_xs.flip(0).double()
-            lane_ys = lane_ys.flip(0)
 
-            if "img_cut_height" in img_meta:
-                cut_height = img_meta["img_cut_height"]
-                ori_img_h = img_meta["img_size"][0]
-                lane_ys = (lane_ys * (ori_img_h - cut_height) +
-                           cut_height) / ori_img_h
-            points = torch.stack(
-                (lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)),
-                dim=1).squeeze(2)
-            lane = Lane(points=points.cpu().numpy(),
-                        metadata={})
-            lanes.append(lane)
-        return lanes
+            # 提取有效点的 x 和 y 坐标
+            lane_points = lane[valid_points]
+            lanes.append(lane_points)  # 添加到当前车道线列表
 
-    def get_lanes(self, output, img_metas, as_lanes=True):
-        """
-        Convert model output to lanes.
-        """
-        softmax = nn.Softmax(dim=1)
+            # 这里假设分类信息需要进一步解析
+            # categories.append(category) (可以根据需要调整)
 
-        decoded = []
-        img_metas = [item for img_meta in img_metas.data for item in img_meta]
-        for predictions, img_meta in zip(output, img_metas):
-            # filter out the conf lower than conf threshold
-            threshold = self.cfg.test_parameters.conf_threshold
-            scores = softmax(predictions[:, :2])[:, 1]
-            keep_inds = scores >= threshold
-            predictions = predictions[keep_inds]
-            scores = scores[keep_inds]
+        # 将当前预测的车道线和类别添加到最终输出
+        out_lanes.append(lanes)
+        out_categories.append(categories)
 
-            if predictions.shape[0] == 0:
-                decoded.append([])
-                continue
+    return out_lanes, out_categories
 
-            nms_preds = predictions.detach().clone()
-            nms_preds[..., 2:4] *= self.n_strips
-            nms_preds[..., 3] = nms_preds[..., 2] + nms_preds[..., 3] - 1
-            nms_preds[..., 4:] *= self.img_w
-
-            keep, num_to_keep, _ = nms(
-                nms_preds,
-                scores,
-                overlap=self.cfg.test_parameters.nms_thres,
-                top_k=self.cfg.max_lanes)
-            keep = keep[:num_to_keep]
-            predictions = predictions[keep]
-
-            if predictions.shape[0] == 0:
-                decoded.append([])
-                continue
-            predictions[:, 3] = torch.round(predictions[:, 3] * self.n_strips)
-            if as_lanes:
-                pred = self.predictions_to_pred(predictions, img_meta)
-            else:
-                pred = predictions
-            decoded.append(pred)
-
-        return decoded
 
     def __repr__(self):
         num_params = sum(map(lambda x: x.numel(), self.parameters()))
