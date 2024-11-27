@@ -40,6 +40,8 @@ class LocalAngleHead(nn.Module):
         )
 
         # 生成特征图的网格坐标 (grid_x, grid_y)
+        #生成从 self.feat_h - 0.5 到 0（不包括）的值，步长为 -1，表示网格的 y 坐标。
+        #生成从 0.5 到 self.feat_w（不包括）的值，步长为 1，表示网格的 x 坐标
         grid_y, grid_x = torch.meshgrid(
             torch.arange(self.feat_h - 0.5, 0, -1, dtype=torch.float32),
             torch.arange(0.5, self.feat_w, 1, dtype=torch.float32),
