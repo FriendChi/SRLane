@@ -52,6 +52,7 @@ class LocalAngleHead(nn.Module):
         # 定义角度预测的卷积层，数量为 FPN 的层数
         self.angle_conv = nn.ModuleList()
         for _ in range(self.cfg.n_fpn):
+            # (batch_size,1,height,width)
             self.angle_conv.append(nn.Conv2d(in_channel, 1, 1, 1, 0, bias=False))
 
         # 如果启用了辅助分割任务，则定义分割相关的卷积层和损失函数
