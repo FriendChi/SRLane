@@ -16,18 +16,17 @@ from srlane.models.registry import HEADS
 
 
 class RefineHead(nn.Module):
-    """Refine head.
-
+    """车道线细化头模块，用于进一步优化车道线预测结果。
+    
     Args:
-        stage: Refinement stage index.
-        num_points: Number of points to describe a lane.
-        prior_feat_channels: Input channel.
-        in_channel: Input channels.
-        fc_hidden_dim: Hidden channels.
-        refine_layers: Total number of refinement stage.
-        sample_points: Number of points for sampling lane feature.
-        num_groups: Number of lane segment groups.
-        cfg: Model config.
+        stage: 当前细化阶段索引。
+        num_points: 用于描述每条车道线的点数。
+        prior_feat_channels: 输入特征通道数。
+        fc_hidden_dim: 全连接层的隐藏层维度。
+        refine_layers: 总的细化阶段数。
+        sample_points: 每条车道线用于采样的点数。
+        num_groups: 车道线分段的组数。
+        cfg: 模型配置对象。
     """
 
     def __init__(self,
@@ -40,158 +39,211 @@ class RefineHead(nn.Module):
                  num_groups: int,
                  cfg=None):
         super(RefineHead, self).__init__()
+        # 初始化基本参数
         self.stage = stage
         self.cfg = cfg
-        self.img_w = self.cfg.img_w
-        self.img_h = self.cfg.img_h
-        self.n_strips = num_points - 1
-        self.n_offsets = num_points
-        self.sample_points = sample_points
-        self.fc_hidden_dim = fc_hidden_dim
-        self.num_groups = num_groups
-        self.num_level = cfg.n_fpn
-        self.last_stage = stage == refine_layers - 1
+        self.img_w = self.cfg.img_w  # 图片宽度
+        self.img_h = self.cfg.img_h  # 图片高度
+        self.n_strips = num_points - 1  # 分段数（车道线点数 - 1）
+        self.n_offsets = num_points  # 每条车道线的点数
+        self.sample_points = sample_points  # 每条车道线采样点数
+        self.fc_hidden_dim = fc_hidden_dim  # 全连接层隐藏单元数
+        self.num_groups = num_groups  # 分组数
+        self.num_level = cfg.n_fpn  # 特征金字塔网络层级数
+        self.last_stage = stage == refine_layers - 1  # 是否为最后一个细化阶段
 
+        # 初始化采样点索引（以 strip 为单位，范围 [0, n_strips]）
         self.register_buffer(name="sample_x_indexs", tensor=(
                 torch.linspace(0, 1,
                                steps=self.sample_points,
                                dtype=torch.float32) * self.n_strips).long())
+        # 初始化采样点的 y 坐标（归一化到 [0, 1]）
         self.register_buffer(name="prior_feat_ys", tensor=torch.flip(
             (1 - self.sample_x_indexs.float() / self.n_strips), dims=[-1]))
 
-        self.prior_feat_channels = prior_feat_channels
+        # 初始化 learnable 的 z_embeddings（用于线性权重计算）
         self.z_embeddings = nn.Parameter(torch.zeros(self.sample_points),
                                          requires_grad=True)
 
+        # 初始化采样特征的全连接层，基于采样点数和分组数
         self.gather_fc = nn.Conv1d(sample_points, fc_hidden_dim,
                                    kernel_size=prior_feat_channels,
                                    groups=self.num_groups)
+        # 混洗特征的线性层
         self.shuffle_fc = nn.Linear(fc_hidden_dim, fc_hidden_dim)
-        self.channel_fc = nn.ModuleList()
+        
+        # 初始化分段注意力和通道全连接模块
         self.segment_attn = nn.ModuleList()
-        for i in range(1):
+        self.channel_fc = nn.ModuleList()
+        for i in range(1):  # 这里只创建一个模块，循环是为了扩展性
             self.segment_attn.append(
                 MultiSegmentAttention(fc_hidden_dim, num_groups=num_groups))
             self.channel_fc.append(
                 nn.Sequential(nn.Linear(fc_hidden_dim, 2 * fc_hidden_dim),
                               nn.ReLU(),
                               nn.Linear(2 * fc_hidden_dim, fc_hidden_dim)))
+        
+        # 初始化回归和分类模块
         reg_modules = list()
         cls_modules = list()
-        for _ in range(1):
+        for _ in range(1):  # 这里只创建一个模块
             reg_modules += [nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
                             nn.ReLU()]
             cls_modules += [nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
                             nn.ReLU()]
-
         self.reg_modules = nn.ModuleList(reg_modules)
         self.cls_modules = nn.ModuleList(cls_modules)
+
+        # 定义最终的回归和分类层
         self.reg_layers = nn.Linear(
             fc_hidden_dim,
-            self.n_offsets + 1 + 1)
-        self.cls_layers = nn.Linear(fc_hidden_dim, 2)
+            self.n_offsets + 1 + 1)  # 偏移点数 + 2 个额外参数
+        self.cls_layers = nn.Linear(fc_hidden_dim, 2)  # 分类为背景或车道线
+
+        # 初始化权重
         self.init_weights()
 
     def init_weights(self):
+        # 初始化分类层参数
         for m in self.cls_layers.parameters():
             nn.init.normal_(m, mean=0., std=1e-3)
+        # 初始化回归层参数
         for m in self.reg_layers.parameters():
             nn.init.normal_(m, mean=0., std=1e-3)
+        # 初始化 z_embeddings 的均值和标准差
         nn.init.normal_(self.z_embeddings, mean=self.cfg.z_mean[self.stage],
                         std=self.cfg.z_std[self.stage])
-
-
-    def translate_to_linear_weight(self,
-                                   ref: Tensor,
-                                   num_total: int = 3,
-                                   tau: int = 2.0):
+        
+    def translate_to_linear_weight(self, ref: Tensor, num_total: int = 3, tau: int = 2.0):
+        """
+        根据参考点计算线性权重，用于采样。
+        
+        Args:
+            ref: 引用点索引。
+            num_total: 总采样点数。
+            tau: 平滑参数。
+        
+        Returns:
+            权重张量，形状为 (1, n_strips, num_total)。
+        """
+        # 创建网格，表示采样点的索引
         grid = torch.arange(num_total, device=ref.device,
                             dtype=ref.dtype).view(
             *[len(ref.shape) * [1, ] + [-1, ]])
+        # 扩展 ref 维度，方便与网格计算
         ref = ref.unsqueeze(-1).clone()
+        # 计算参考点与网格点的距离平方，并应用软化函数
         l2 = (ref - grid).pow(2.0).div(tau).abs().neg()
+        # 应用 softmax 转换为权重
         weight = torch.softmax(l2, dim=-1)
 
-        return weight  # (1, 36, 3)
+        return weight
 
-    def pool_prior_features(self,
-                            batch_features: List[Tensor],
-                            num_priors: int,
-                            prior_feat_xs: Tensor, ):
-        """Pool prior feature from feature map.
-        Args:
-            batch_features: Input feature maps.
-        """
-        batch_size = batch_features[0].shape[0]
+def pool_prior_features(self,
+                        batch_features: List[Tensor],
+                        num_priors: int,
+                        prior_feat_xs: Tensor, ):
+    """从特征图中池化先验特征。
 
-        prior_feat_xs = prior_feat_xs.view(batch_size, num_priors, -1, 1)
-        prior_feat_ys = self.prior_feat_ys.unsqueeze(0).expand(
-            batch_size * num_priors,
-            self.sample_points).view(
-            batch_size, num_priors, -1, 1)
+    Args:
+        batch_features: 输入的特征图。
+        num_priors: 先验框的数量。
+        prior_feat_xs: 先验框在特征图上的 x 坐标。
+    """
+    batch_size = batch_features[0].shape[0]  # 获取批次大小
 
-        grid = torch.cat((prior_feat_xs, prior_feat_ys), dim=-1)
-        if self.training or not hasattr(self, "z_weight"):
-            z_weight = self.translate_to_linear_weight(self.z_embeddings)
-            z_weight = z_weight.view(1, 1, self.sample_points, -1).expand(
-                batch_size,
-                num_priors,
-                self.sample_points,
-                self.num_level)
-        else:
-            z_weight = self.z_weight.view(1, 1, self.sample_points, -1).expand(
-                batch_size,
-                num_priors,
-                self.sample_points,
-                self.num_level)
+    # 调整先验框的 x 坐标形状，使其适应池化操作
+    prior_feat_xs = prior_feat_xs.view(batch_size, num_priors, -1, 1)
 
-        feature = sampling_3d(grid, z_weight,
-                              batch_features)  # (b, n_prior, n_point, c)
-        feature = feature.view(batch_size * num_priors, -1,
-                               self.prior_feat_channels)
-        feature = self.gather_fc(feature).reshape(batch_size, num_priors, -1)
-        for i in range(1):
-            res_feature, attn = self.segment_attn[i](feature, attn_mask=None)
-            feature = feature + self.channel_fc[i](res_feature)
-        return feature, attn
+    # 获取与 prior_feat_xs 对应的 y 坐标，并进行调整
+    prior_feat_ys = self.prior_feat_ys.unsqueeze(0).expand(
+        batch_size * num_priors,
+        self.sample_points).view(
+        batch_size, num_priors, -1, 1)
 
-    def forward(self, batch_features, priors, pre_feature=None):
-        batch_size = batch_features[-1].shape[0]
-        num_priors = priors.shape[1]
-        prior_feat_xs = (priors[..., 4 + self.sample_x_indexs]).flip(
-            dims=[2])  # top to bottom
+    # 合并 x 和 y 坐标，形成完整的空间坐标
+    grid = torch.cat((prior_feat_xs, prior_feat_ys), dim=-1)
 
-        batch_prior_features, attn = self.pool_prior_features(
-            batch_features, num_priors, prior_feat_xs)
+    # 如果是训练模式，或者 z_weight 没有被初始化
+    if self.training or not hasattr(self, "z_weight"):
+        # 计算 z_weight 权重，基于 z_embeddings
+        z_weight = self.translate_to_linear_weight(self.z_embeddings)
+        z_weight = z_weight.view(1, 1, self.sample_points, -1).expand(
+            batch_size,
+            num_priors,
+            self.sample_points,
+            self.num_level)
+    else:
+        # 使用已经计算过的 z_weight
+        z_weight = self.z_weight.view(1, 1, self.sample_points, -1).expand(
+            batch_size,
+            num_priors,
+            self.sample_points,
+            self.num_level)
 
-        fc_features = batch_prior_features
-        fc_features = fc_features.reshape(batch_size * num_priors,
-                                          self.fc_hidden_dim)
+    # 使用采样函数进行 3D 特征采样
+    feature = sampling_3d(grid, z_weight,
+                          batch_features)  # (b, n_prior, n_point, c)
+    feature = feature.view(batch_size * num_priors, -1,
+                           self.prior_feat_channels)
 
-        if pre_feature is not None:
-            fc_features = fc_features + pre_feature.view(*fc_features.shape)
+    # 通过卷积层进一步处理特征
+    feature = self.gather_fc(feature).reshape(batch_size, num_priors, -1)
 
-        cls_features = fc_features
-        reg_features = fc_features
-        predictions = priors.clone()
-        if self.training or self.last_stage:
-            for cls_layer in self.cls_modules:
-                cls_features = cls_layer(cls_features)
-            cls_logits = self.cls_layers(cls_features)
-            cls_logits = cls_logits.reshape(
-                batch_size, -1, cls_logits.shape[1])  # (B, num_priors, 2)
-            predictions[:, :, :2] = cls_logits
-        for reg_layer in self.reg_modules:
-            reg_features = reg_layer(reg_features)
-        reg = self.reg_layers(reg_features)
-        reg = reg.reshape(batch_size, -1, reg.shape[1])
+    # 通过多段注意力模块处理特征
+    for i in range(1):
+        res_feature, attn = self.segment_attn[i](feature, attn_mask=None)
+        # 将注意力输出与原特征相加
+        feature = feature + self.channel_fc[i](res_feature)
 
-        #  predictions[:, :, 2] += reg[:, :, 0]
-        # predictions[:, :, 3] = reg[:, :, 1]
-        # predictions[..., 4:] += reg[..., 2:]
-        predictions[:, :, 2:] += reg
+    return feature, attn  # 返回处理后的特征和注意力
 
-        return predictions, fc_features, attn
+def forward(self, batch_features, priors, pre_feature=None):
+    batch_size = batch_features[-1].shape[0]  # 获取批次大小
+    num_priors = priors.shape[1]  # 获取先验框数量
+
+    # 根据先验框的索引，获取对应的特征坐标
+    prior_feat_xs = (priors[..., 4 + self.sample_x_indexs]).flip(
+        dims=[2])  # 从上到下翻转
+
+    # 从特征图中池化先验特征
+    batch_prior_features, attn = self.pool_prior_features(
+        batch_features, num_priors, prior_feat_xs)
+
+    # 对池化后的特征进行处理
+    fc_features = batch_prior_features
+    fc_features = fc_features.reshape(batch_size * num_priors,
+                                      self.fc_hidden_dim)
+
+    # 如果存在前一阶段的特征，将其与当前特征相加
+    if pre_feature is not None:
+        fc_features = fc_features + pre_feature.view(*fc_features.shape)
+
+    # 将特征分为分类和回归部分
+    cls_features = fc_features
+    reg_features = fc_features
+    predictions = priors.clone()  # 克隆原始的先验框
+
+    # 如果是训练模式或最后一个阶段，进行分类
+    if self.training or self.last_stage:
+        for cls_layer in self.cls_modules:
+            cls_features = cls_layer(cls_features)
+        cls_logits = self.cls_layers(cls_features)  # 进行分类预测
+        cls_logits = cls_logits.reshape(
+            batch_size, -1, cls_logits.shape[1])  # 重新调整形状 (B, num_priors, 2)
+        predictions[:, :, :2] = cls_logits  # 更新预测的分类结果
+
+    # 进行回归部分的处理
+    for reg_layer in self.reg_modules:
+        reg_features = reg_layer(reg_features)
+    reg = self.reg_layers(reg_features)  # 进行回归预测
+    reg = reg.reshape(batch_size, -1, reg.shape[1])
+
+    # 更新回归结果到预测框
+    predictions[:, :, 2:] += reg
+
+    return predictions, fc_features, attn  # 返回预测结果、特征和注意力
+
 
 
 @HEADS.register_module
